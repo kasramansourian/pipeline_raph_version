@@ -1,0 +1,144 @@
+function [data] = toggle_sync(data)
+%TOGGLE_SYNC Summary of this function goes here
+%   Detailed explanation goes here
+    num_of_devices = length(data.neural);
+    all_offset = [];
+     
+    ekg_mask = cell2mat(cellfun(@(x) any(strcmpi(x,{'Reference Contacts','Electrode','Ref_Scalp'})),data.brainvision.label,'UniformOutput',false));
+    
+    if sum(ekg_mask) == 0
+        ekg_mask = cell2mat(cellfun(@(x) any(strcmpi(x,{'EKG','ECG'})),data.brainvision.label,'UniformOutput',false));
+    end
+    if sum(ekg_mask) == 0; error('No EKG Channel Found! Please check Brainvision recording includes a labeled EKG channel.');end
+    ekg = data.brainvision.trial{1,1}(ekg_mask,:);
+    ekg_time = data.brainvision.brainvision_start_timestamp_unix  + data.brainvision.time{1,1}*1e3;
+    
+    % [~, ekg_2nd_event_ind] = min(abs(ekg_time-data.processed.Events.Timestamp(2)));
+    % [~, ekg_last_event_ind] = min(abs(ekg_time-data.processed.Events.Timestamp(end)));
+    midpoint_ind = round(length(ekg)/2);
+
+    [start_ekg_toggle_inds, start_ekg_toggle_bool] = find_ekg_toggles(ekg(1:midpoint_ind),data.brainvision.fsample);
+    [end_ekg_toggle_inds, end_ekg_toggle_bool] = find_ekg_toggles(ekg(midpoint_ind:end),data.brainvision.fsample);
+    end_ekg_toggle_inds = end_ekg_toggle_inds + midpoint_ind;
+    
+
+
+    lfp = cellfun(@(x) x(:,contains(fields(x),'TD_')),{data.neural.combined_data_table}','UniformOutput',false);
+    
+    for ins = 1:length(lfp)
+        can_be_toggle_algined = [false,false]; %Later set to true if can be synced 
+        lfp_time = cellfun(@(x) x.Timestamp,{data.neural.combined_data_table}','UniformOutput',false);
+        start_toggle_ms_offset = 0;
+        drift = 0;
+        drift_correction_ratio = 1;
+        start_lfp_xcorr_r = [];
+        start_lfp_xcorr_lag = [];
+        end_lfp_xcorr_r = [];
+        end_lfp_xcorr_lag = [];
+        for chan = 1:width(lfp{ins})
+            lfp_midpoint = round(height(lfp{ins})/2);
+            %Find Start Toggles
+            [start_lfp_toggles_sample_number{ins,chan}, start_lfp_toggles_bool{ins,chan}] = find_lfp_toggles(lfp{ins}{1:lfp_midpoint,chan}',data.neural(ins).fs,data.brainvision.fsample);
+            [end_lfp_toggles_sample_number{ins,chan}, end_lfp_toggles_bool{ins,chan}] = find_lfp_toggles(lfp{ins}{lfp_midpoint:end,chan}',data.neural(ins).fs,data.brainvision.fsample);
+        end
+        figure; hold on;
+        plot(datetime(ekg_time/1000, 'convertfrom', 'posixtime'),ekg/max(ekg))
+        %Identify Best Channel for start toggle alignment
+
+        if ~isempty(start_ekg_toggle_inds)
+
+            lfp_start_sync_ind = round(start_lfp_toggles_sample_number{ins,chan}(1) / 5000  * 250);
+            ekg_start_sync_ind = start_ekg_toggle_inds(1);
+
+            lfp_start_syncpoint = lfp_time{ins}(lfp_start_sync_ind);
+            ekg_start_syncpoint = ekg_time(ekg_start_sync_ind);
+            start_lfp_time_offset_in_ms{ins} = ekg_start_syncpoint-lfp_start_syncpoint;
+            start_toggle_ms_offset = start_lfp_time_offset_in_ms{ins};
+            lfp_time{ins} = lfp_time{ins} + start_lfp_time_offset_in_ms{ins};    
+            can_be_toggle_algined(1)=true;
+            plot(datetime(ekg_time(1:midpoint_ind)/1000, 'convertfrom', 'posixtime'),start_ekg_toggle_bool,'Color','blue','LineWidth',2)
+
+            scatter(datetime(ekg_time(ekg_start_sync_ind)/1000, 'convertfrom', 'posixtime'),1.1)
+            scatter(datetime(lfp_time{ins}(lfp_start_sync_ind)/1000, 'convertfrom', 'posixtime'),1.2)
+        end
+            
+        %Identify Best Channel for end toggle alignment
+        if ~isempty(end_ekg_toggle_inds)
+
+            lfp_end_sync_ind = round(end_lfp_toggles_sample_number{ins,chan}(1) / 5000  * 250) + lfp_midpoint;
+            ekg_end_sync_ind = end_ekg_toggle_inds(1);
+
+            lfp_end_syncpoint = lfp_time{ins}(lfp_end_sync_ind);
+            ekg_end_syncpoint = ekg_time(ekg_end_sync_ind);
+            end_lfp_time_offset_in_ms{ins} = ekg_end_syncpoint-lfp_end_syncpoint;
+
+            if isempty(start_ekg_toggle_bool)
+                lfp_time{ins} = lfp_time{ins} + end_lfp_time_offset_in_ms{ins};
+                start_toggle_ms_offset = end_lfp_time_offset_in_ms{ins};
+            else
+                %Drift Correction if possible (need start and end toggles)
+                drift = end_lfp_time_offset_in_ms{ins}; %start_sync_point_already aligned to 0
+                ms_from_start_syncpoint = (lfp_time{ins}-lfp_time{ins}(lfp_start_sync_ind));
+                drift_correction_ratio = (ms_from_start_syncpoint(lfp_end_sync_ind) + drift)/ms_from_start_syncpoint(lfp_end_sync_ind);
+                lfp_time{ins} = lfp_time{ins}(lfp_start_sync_ind) + (ms_from_start_syncpoint * drift_correction_ratio);
+            end
+            can_be_toggle_algined(2)=true;
+                        
+
+            scatter(datetime(ekg_time(ekg_end_sync_ind)/1000, 'convertfrom', 'posixtime'),1.1)
+            scatter(datetime(lfp_time{ins}(lfp_end_sync_ind)/1000, 'convertfrom', 'posixtime'),1.2)
+            plot(datetime(ekg_time(midpoint_ind:end)/1000, 'convertfrom', 'posixtime'),end_ekg_toggle_bool,'Color','blue','LineWidth',2)
+        end  
+  
+
+        plot(datetime(lfp_time{ins}/1000, 'convertfrom', 'posixtime'),table2array(lfp{ins})/max(table2array(lfp{ins})),'Color','red')
+        plot(datetime(linspace(lfp_time{ins}(1),lfp_time{ins}(lfp_midpoint),length(start_lfp_toggles_bool{ins,chan}))/1000, 'convertfrom', 'posixtime'),start_lfp_toggles_bool{ins,chan},'Color','red','LineWidth',2)
+        plot(datetime(linspace(lfp_time{ins}(lfp_midpoint),lfp_time{ins}(end),length(end_lfp_toggles_bool{ins,chan}))/1000, 'convertfrom', 'posixtime'),end_lfp_toggles_bool{ins,chan},'Color','red','LineWidth',2)
+        title(['Toggle Sync (Subject: ' data.subject_id ', Date: ' char(data.date) ', Task: ' data.task ' ' num2str(data.session) ')'])
+        
+       
+        
+        do_manual_toggle_sync = input('Enter 0 to Continue or Enter 1 for Manual Time Sync: ');
+        data.neural(ins).manual_sync = logical(do_manual_toggle_sync);
+        if do_manual_toggle_sync
+            lfp_time_orig = cellfun(@(x) x.Timestamp,{data.neural.combined_data_table}','UniformOutput',false);
+            if isempty(start_ekg_toggle_inds) && isempty(end_ekg_toggle_inds)
+                start_ekg_toggle_inds_tmp = [5001,7501];
+                end_ekg_toggle_inds_tmp = [length(ekg)-2501,length(ekg)-5001];
+            elseif isempty(start_ekg_toggle_inds)
+                start_ekg_toggle_inds_tmp = 5001*ones(size(end_ekg_toggle_inds));
+                end_ekg_toggle_inds_tmp = end_ekg_toggle_inds;
+            elseif isempty(end_ekg_toggle_inds)
+                end_ekg_toggle_inds_tmp = (length(ekg)-5001)*ones(size(start_ekg_toggle_inds));
+                start_ekg_toggle_inds_tmp = start_ekg_toggle_inds;
+            end
+
+            ekg_toggle_range_estimate = [start_ekg_toggle_inds_tmp;end_ekg_toggle_inds_tmp];
+ 
+            lfp_toggle_range_estimate = [round(start_lfp_toggles_sample_number{ins,chan} / 5000  * 250);round(end_lfp_toggles_sample_number{ins,chan} / 5000  * 250)+lfp_midpoint];
+            
+            [lfp_time{ins},start_toggle_ms_offset,drift,drift_correction_ratio,can_be_toggle_algined] = manual_sync(...
+                ekg,ekg_time,lfp{ins},lfp_time_orig{ins},ekg_toggle_range_estimate, lfp_toggle_range_estimate);
+
+                
+        end
+
+        
+        data.neural(ins).Applied_msec_Offset_Correction = start_toggle_ms_offset;
+        data.neural(ins).drift = drift;
+        data.neural(ins).drift_correction_ratio = drift_correction_ratio;
+        data.neural(ins).toggle_aligned = can_be_toggle_algined;
+        data.neural(ins).combined_data_table.Timestamp = lfp_time{ins};
+        data.neural(ins).combined_data_table.Datetime  = datetime(lfp_time{ins}/1000,...
+                                                        'ConvertFrom','posixtime', ...
+                                                        'Format',data.constants.timestamp_string_format, ...
+                                                        'TimeZone',data.constants.houston_timezone);
+
+    end
+
+  
+    
+
+
+end
+
